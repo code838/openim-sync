@@ -1,0 +1,262 @@
+name: Fork and sync all OpenIM repositories
+
+on:
+  workflow_dispatch:
+    inputs:
+      preview:
+        description: "Preview only: list the actions without changing repositories"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+
+# Authentication uses OPENIM_SYNC_TOKEN, not this repository's GITHUB_TOKEN.
+permissions: {}
+
+concurrency:
+  group: openim-all-sync
+  cancel-in-progress: false
+
+jobs:
+  fork-and-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.OPENIM_SYNC_TOKEN }}
+      SOURCE_ORG: openimsdk
+      DEST_OWNER: ${{ github.repository_owner }}
+      REPO_PREFIX: ""
+      PREVIEW: ${{ inputs.preview || false }}
+    steps:
+      - name: Discover, fork, and sync repositories
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          TOKEN = os.environ.get("GH_TOKEN", "")
+          SOURCE_ORG = os.environ["SOURCE_ORG"]
+          DEST_OWNER = os.environ["DEST_OWNER"]
+          PREFIX = os.environ.get("REPO_PREFIX", "")
+          PREVIEW = os.environ.get("PREVIEW", "false").lower() == "true"
+          CONTROL_REPO = os.environ.get("GITHUB_REPOSITORY", "").lower()
+          outcomes = []
+          claimed_targets = {}
+
+          class APIError(RuntimeError):
+              def __init__(self, status, message):
+                  super().__init__(f"HTTP {status}: {message}")
+                  self.status = status
+
+          class RateLimited(RuntimeError):
+              pass
+
+          def clean(value):
+              text = str(value)
+              return text.replace(TOKEN, "[REDACTED]") if TOKEN else text
+
+          def record(source, status, detail):
+              row = (source, status, clean(detail))
+              outcomes.append(row)
+              print(f"[{status}] {source}: {row[2]}", flush=True)
+
+          def api(method, path, body=None, missing_ok=False):
+              data = None if body is None else json.dumps(body).encode()
+              request = urllib.request.Request(
+                  "https://api.github.com/" + path.lstrip("/"),
+                  data=data, method=method,
+                  headers={"Authorization": "Bearer " + TOKEN,
+                           "Accept": "application/vnd.github+json",
+                           "X-GitHub-Api-Version": "2026-03-10",
+                           "Content-Type": "application/json",
+                           "User-Agent": "openim-bulk-fork-sync"})
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(request, timeout=40) as response:
+                          payload = response.read()
+                          return json.loads(payload) if payload else None
+                  except urllib.error.HTTPError as error:
+                      payload = error.read().decode("utf-8", "replace")
+                      try:
+                          message = json.loads(payload).get("message", payload)
+                      except (ValueError, AttributeError):
+                          message = payload
+                      message = clean(message)[:1000]
+                      if error.code == 404 and missing_ok:
+                          return None
+                      limited = error.code == 429 or (
+                          error.code == 403 and "rate limit" in message.lower())
+                      if limited:
+                          try:
+                              delay = max(2, float(error.headers.get("Retry-After", "5")))
+                          except ValueError:
+                              delay = 5
+                          if error.headers.get("X-RateLimit-Remaining") == "0":
+                              raise RateLimited("API rate limit exhausted; retry a later run.")
+                          if attempt == 2 or delay > 30:
+                              raise RateLimited("API rate limited; retry a later run.")
+                          time.sleep(delay)
+                          continue
+                      if error.code >= 500 and method == "GET" and attempt < 2:
+                          time.sleep(2 ** (attempt + 1))
+                          continue
+                      raise APIError(error.code, message) from None
+
+          def list_sources():
+              result = []
+              page = 1
+              while True:
+                  items = api("GET", f"orgs/{SOURCE_ORG}/repos?type=public&per_page=100&page={page}")
+                  result.extend(item for item in items if not item.get("private"))
+                  if len(items) < 100:
+                      break
+                  page += 1
+              return sorted(result, key=lambda item: item["full_name"].lower())
+
+          def branch_info(repository, branch):
+              encoded = urllib.parse.quote(branch, safe="")
+              return api("GET", f"repos/{repository}/branches/{encoded}", missing_ok=True)
+
+          def verify_target(source, target):
+              name = target["full_name"]
+              if name.lower() == CONTROL_REPO:
+                  raise RuntimeError("The destination is the control repository; skipped.")
+              if target["owner"]["login"].lower() != DEST_OWNER.lower():
+                  raise RuntimeError("Fork API returned a repository owned by a different account.")
+              source_root = (source.get("source") or source)["id"]
+              target_root = (target.get("source") or {}).get("id")
+              direct_parent = (target.get("parent") or {}).get("id") == source["id"]
+              if not target.get("fork") or not (direct_parent or target_root == source_root):
+                  raise RuntimeError(f"{name} is not a fork in the expected source network; left unchanged.")
+              previous = claimed_targets.get(target["id"])
+              if previous and previous != source["id"]:
+                  raise RuntimeError(f"{name} already maps to another source in this run; left unchanged.")
+              claimed_targets[target["id"]] = source["id"]
+              if target.get("archived") or target.get("disabled"):
+                  raise RuntimeError(f"Destination {name} is archived or disabled; left unchanged.")
+              return name
+
+          def handle_source(source, destination_type):
+              source_name = source["full_name"]
+              if source.get("disabled"):
+                  record(source_name, "SKIPPED", "Source repository is disabled.")
+                  return
+              branch = source.get("default_branch")
+              if not branch:
+                  record(source_name, "SKIPPED", "Source has no default branch.")
+                  return
+              source_branch = branch_info(source_name, branch)
+              if source_branch is None:
+                  branches = api("GET", f"repos/{source_name}/branches?per_page=1")
+                  if not branches:
+                      record(source_name, "SKIPPED", "Empty source repository cannot be forked.")
+                      return
+                  raise RuntimeError(f"Source default branch {branch!r} is unavailable; retry later.")
+              # List endpoints omit parent/source; obtain these for forked sources.
+              if source.get("fork"):
+                  source = api("GET", f"repos/{source_name}")
+              expected = f"{DEST_OWNER}/{PREFIX}{source['name']}"
+              target = api("GET", f"repos/{expected}", missing_ok=True)
+              if target is None:
+                  if PREVIEW:
+                      record(source_name, "PREVIEW_CREATE", f"Would request fork {expected}; current branches included.")
+                      return
+                  body = {"name": PREFIX + source["name"], "default_branch_only": False}
+                  if destination_type == "Organization":
+                      body["organization"] = DEST_OWNER
+                  created = api("POST", f"repos/{source_name}/forks", body)
+                  returned = created["full_name"]
+                  returned_owner = (created.get("owner") or {}).get("login", "")
+                  if returned_owner.lower() != DEST_OWNER.lower():
+                      raise RuntimeError("Fork API returned a repository owned by a different account.")
+                  previous = claimed_targets.get(created["id"])
+                  if previous and previous != source["id"]:
+                      raise RuntimeError(f"{returned} already maps to another source in this run; left unchanged.")
+                  claimed_targets[created["id"]] = source["id"]
+                  if returned.lower() == expected.lower():
+                      record(source_name, "CREATED_PENDING", f"Fork accepted: {returned}. Next run verifies and syncs {branch}.")
+                      return
+                  # GitHub can return an existing, renamed fork in the same network.
+                  target = api("GET", f"repos/{returned}", missing_ok=True)
+                  if target is None:
+                      record(source_name, "PENDING", f"Fork {returned} is not ready yet; retry next run.")
+                      return
+              target_name = verify_target(source, target)
+              if PREVIEW:
+                  record(source_name, "PREVIEW_SYNC", f"Would sync {target_name}:{branch} from {source_name}:{branch} without force.")
+                  return
+              target_branch = branch_info(target_name, branch)
+              if target_branch is None:
+                  # Fresh forks are asynchronous; do not create refs until Git is ready.
+                  existing_branches = api("GET", f"repos/{target_name}/branches?per_page=1")
+                  if not existing_branches:
+                      record(source_name, "PENDING", f"{target_name} has no branches yet; retry next run.")
+                      return
+                  api("POST", f"repos/{target_name}/git/refs",
+                      {"ref": "refs/heads/" + branch, "sha": source_branch["commit"]["sha"]})
+              source_sha = source_branch["commit"]["sha"]
+              if target_branch and target_branch["commit"]["sha"] == source_sha:
+                  record(source_name, "UP_TO_DATE", f"{target_name}:{branch} already matches the source.")
+                  return
+              encoded = urllib.parse.quote(branch, safe="")
+              # force:false lets GitHub enforce fast-forward atomically. A divergent
+              # branch fails here and is never merged, reset, or overwritten.
+              api("PATCH", f"repos/{target_name}/git/refs/heads/{encoded}",
+                  {"sha": source_sha, "force": False})
+              record(source_name, "SYNCED", f"{target_name}:{branch}; source={source_name}:{branch}; fast-forward only.")
+
+          def main():
+              if not TOKEN:
+                  raise RuntimeError("Add the Actions secret OPENIM_SYNC_TOKEN (classic PAT: public_repo and workflow).")
+              if SOURCE_ORG.lower() == DEST_OWNER.lower():
+                  raise RuntimeError("Source and destination must be different accounts.")
+              actor = api("GET", "user")["login"]
+              destination_type = api("GET", f"users/{DEST_OWNER}")["type"]
+              if destination_type != "Organization" and actor.lower() != DEST_OWNER.lower():
+                  raise RuntimeError("For a personal destination, the token must belong to that account.")
+              sources = list_sources()
+              print(f"Found {len(sources)} public repositories; preview={PREVIEW}.", flush=True)
+              for source in sources:
+                  try:
+                      handle_source(source, destination_type)
+                  except RateLimited as error:
+                      record(source["full_name"], "ERROR", str(error) + " Remaining repositories deferred.")
+                      break
+                  except Exception as error:
+                      record(source["full_name"], "ERROR", error)
+                  finally:
+                      time.sleep(1)
+
+          def write_summary():
+              counts = collections.Counter(status for _, status, _ in outcomes)
+              def cell(text):
+                  return clean(text).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+              lines = ["## OpenIM fork and sync", "",
+                       f"Source: `{SOURCE_ORG}` · Destination: `{DEST_OWNER}` · Preview: `{PREVIEW}`", "",
+                       "Initial forks include existing branches. Recurring sync updates only each source's current default branch.",
+                       "No force pushes, deletions, destination default-branch changes, or execution of upstream code.",
+                       "Tags, Releases, release assets, Issues, and PRs are not continuously mirrored.", "",
+                       " / ".join(f"{name}: {count}" for name, count in sorted(counts.items())), "",
+                       "| Source | Status | Details |", "| --- | --- | --- |"]
+              lines.extend(f"| {cell(source)} | {cell(status)} | {cell(detail)} |" for source, status, detail in outcomes)
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if path:
+                  with open(path, "a", encoding="utf-8") as output:
+                      output.write("\n".join(lines) + "\n")
+              print("Summary: " + str(dict(counts)), flush=True)
+
+          try:
+              main()
+          except Exception as error:
+              record("BATCH", "ERROR", error)
+          finally:
+              write_summary()
+          sys.exit(1 if any(status == "ERROR" for _, status, _ in outcomes) else 0)
+          PY
