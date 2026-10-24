@@ -32,7 +32,9 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
+          import base64
           import collections
+          import datetime
           import json
           import os
           import sys
@@ -47,6 +49,8 @@ jobs:
           PREFIX = os.environ.get("REPO_PREFIX", "")
           PREVIEW = os.environ.get("PREVIEW", "false").lower() == "true"
           CONTROL_REPO = os.environ.get("GITHUB_REPOSITORY", "").lower()
+          STATUS_SCHEMA = "openim-fork-sync-status/v1"
+          discovered_count = None
           outcomes = []
           claimed_targets = {}
 
@@ -213,6 +217,8 @@ jobs:
               record(source_name, "SYNCED", f"{target_name}:{branch}; source={source_name}:{branch}; fast-forward only.")
 
           def main():
+              global discovered_count
+              discovered_count = None
               if not TOKEN:
                   raise RuntimeError("Add the Actions secret OPENIM_SYNC_TOKEN (classic PAT: public_repo and workflow).")
               if SOURCE_ORG.lower() == DEST_OWNER.lower():
@@ -222,6 +228,7 @@ jobs:
               if destination_type != "Organization" and actor.lower() != DEST_OWNER.lower():
                   raise RuntimeError("For a personal destination, the token must belong to that account.")
               sources = list_sources()
+              discovered_count = len(sources)
               print(f"Found {len(sources)} public repositories; preview={PREVIEW}.", flush=True)
               for source in sources:
                   try:
@@ -233,6 +240,52 @@ jobs:
                       record(source["full_name"], "ERROR", error)
                   finally:
                       time.sleep(1)
+
+          def write_daily_status():
+              # One small commit per UTC day keeps the public control repository active.
+              # This file contains only public counts, never API responses or credentials.
+              if PREVIEW or discovered_count is None:
+                  return
+              parts = CONTROL_REPO.split("/")
+              run_id = os.environ.get("GITHUB_RUN_ID", "")
+              if len(parts) != 2 or not all(parts) or parts[0] != DEST_OWNER.lower() or not run_id.isdigit():
+                  record("CONTROL", "STATUS_SKIPPED", "Control repository or run identity is unavailable.")
+                  return
+              now = datetime.datetime.now(datetime.timezone.utc)
+              today = now.date().isoformat()
+              path = f"repos/{CONTROL_REPO}/contents/sync-status.json"
+              current = api("GET", path, missing_ok=True)
+              if current is not None:
+                  try:
+                      if current.get("type") != "file" or current.get("encoding") != "base64" or not current.get("sha"):
+                          raise ValueError("Not a regular encoded file")
+                      content = "".join(current["content"].split())
+                      previous = json.loads(base64.b64decode(content, validate=True).decode("utf-8"))
+                      if not isinstance(previous, dict) or previous.get("schema") != STATUS_SCHEMA:
+                          raise ValueError("Unrecognized schema")
+                  except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+                      record("CONTROL", "STATUS_SKIPPED", "Existing sync-status.json is not owned by this feature; preserved.")
+                      return
+                  if previous.get("date_utc") == today:
+                      record("CONTROL", "STATUS_CURRENT", "Daily status is already recorded for this UTC date.")
+                      return
+              status = {
+                  "schema": STATUS_SCHEMA,
+                  "date_utc": today,
+                  "updated_at_utc": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+                  "run_url": f"https://github.com/{CONTROL_REPO}/actions/runs/{run_id}",
+                  "source_repository_count": discovered_count,
+                  "counts": dict(sorted(collections.Counter(state for _, state, _ in outcomes).items())),
+              }
+              body = {
+                  "message": f"Record OpenIM sync status for {today}",
+                  "content": base64.b64encode((json.dumps(status, indent=2) + "\n").encode()).decode(),
+              }
+              if current is not None:
+                  body["sha"] = current["sha"]
+              # A stale SHA / concurrent creation is reported, never forced or retried.
+              api("PUT", path, body)
+              record("CONTROL", "STATUS_RECORDED", "Recorded today's public summary in the control repository.")
 
           def write_summary():
               counts = collections.Counter(status for _, status, _ in outcomes)
@@ -257,6 +310,12 @@ jobs:
           except Exception as error:
               record("BATCH", "ERROR", error)
           finally:
+              try:
+                  write_daily_status()
+              except Exception as error:
+                  status = getattr(error, "status", None)
+                  reason = f"HTTP {status}" if status else type(error).__name__
+                  record("CONTROL", "STATUS_SKIPPED", f"Daily status could not be confirmed ({reason}); no forced retry.")
               write_summary()
           sys.exit(1 if any(status == "ERROR" for _, status, _ in outcomes) else 0)
           PY
